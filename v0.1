@@ -1,0 +1,201 @@
+terraform {
+  required_providers {
+    aws = {
+      source  = "hashicorp/aws"
+      version = "~> 5.0"
+    }
+  }
+}
+
+# Configure the AWS Provider
+provider "aws" {
+  region     = "ap-southeast-1"
+  access_key = "XXXXXXXXXXXXXXXX"
+  secret_key = "XXXXXXXXXXXXXXXX"
+}
+
+# Create a VPC
+resource "aws_vpc" "terraform-vpc" {
+  cidr_block = "10.0.0.0/16"
+  tags = {
+    Name = "terraform-vpc"
+  }
+
+}
+
+#Create Subnets
+resource "aws_subnet" "terraform_public_subnet" {
+  vpc_id     = aws_vpc.terraform-vpc.id #only change in main place
+  cidr_block = "10.0.10.0/24"
+  tags = {
+    Name = "terraform_public_subnet"
+  }
+}
+
+#Create Subnets
+resource "aws_subnet" "terraform_private_subnet" {
+  vpc_id     = aws_vpc.terraform-vpc.id #only change in main place
+  cidr_block = "10.0.20.0/24"
+  tags = {
+    Name = "terraform_private_subnet"
+  }
+}
+# Create Internet Gateway
+resource "aws_internet_gateway" "terraform-igw" {
+  vpc_id = aws_vpc.terraform-vpc.id
+
+  tags = {
+    Name = "terraform-igw"
+  }
+}
+
+#Create Public Route Table
+resource "aws_route_table" "terraform-public-rt" {
+  vpc_id = aws_vpc.terraform-vpc.id
+
+  route { # Route table Association to IGW (terraform-public-rt -> terraform-igw)
+    cidr_block = "0.0.0.0/0"
+    gateway_id = aws_internet_gateway.terraform-igw.id
+  }
+
+  tags = {
+    Name = "terraform-public-rt"
+  }
+}
+
+#Create Private Route Table
+resource "aws_route_table" "terraform-private-rt" {
+  vpc_id = aws_vpc.terraform-vpc.id
+  tags = {
+    Name = "terraform-private-rt"
+  }
+   route {
+    cidr_block = "0.0.0.0/0"
+    nat_gateway_id = aws_nat_gateway.terraform-nat.id
+  }
+
+}
+
+# Route table Association to subnet (Eg; Private Subnet have been attached with Private RT)
+resource "aws_route_table_association" "Public-rt-to-Public-subnet" {
+  subnet_id      = aws_subnet.terraform_public_subnet.id
+  route_table_id = aws_route_table.terraform-public-rt.id
+}
+resource "aws_route_table_association" "Private-rt-to-Private-subnet" {
+  subnet_id      = aws_subnet.terraform_private_subnet.id
+  route_table_id = aws_route_table.terraform-private-rt.id
+}
+
+#LAB> NAT connect, security groups, get internet access to Private subnet
+
+resource "aws_eip" "terraform-eip" {
+  domain = "vpc"
+  tags = {
+    "Name" = "terraform-eip"
+  }
+}
+
+resource "aws_nat_gateway" "terraform-nat" {
+  allocation_id = aws_eip.terraform-eip.id
+  subnet_id     = aws_subnet.terraform_public_subnet.id
+
+  tags = {
+    Name = "terraform-nat"
+  }
+}
+
+# Create SG -> inbound -> outbound (When SG have been made the changes, Be aware the changes are destroyed the origninal config setting like EC2, ipaddress. )
+resource "aws_security_group" "web-sg" {
+  name        = "web-sg"
+  description = "Allow all inbound traffic and all outbound traffic"
+  vpc_id      = aws_vpc.terraform-vpc.id
+
+  tags = {
+    Name = "web-sg"
+  }
+}
+
+resource "aws_vpc_security_group_ingress_rule" "allow-inbound-all_traffic" {
+  security_group_id = aws_security_group.web-sg.id
+  cidr_ipv4         = "0.0.0.0/0"
+  ip_protocol       = "-1" # semantically equivalent to all ports
+}
+
+resource "aws_vpc_security_group_egress_rule" "allow_all_traffic_terraform" {
+  security_group_id = aws_security_group.web-sg.id
+  cidr_ipv4         = "0.0.0.0/0"
+  ip_protocol       = "-1" # semantically equivalent to all ports
+}
+
+# Create Private SG
+resource "aws_security_group" "private-sg" {
+  name        = "private-sg"
+  description = "Allow all SSH traffic"
+  vpc_id      = aws_vpc.terraform-vpc.id
+  tags = {
+    Name = "private-sg"
+  }
+}
+
+
+resource "aws_vpc_security_group_egress_rule" "allow_alloutbound_privatetraffic" {
+  security_group_id = aws_security_group.private-sg.id
+  cidr_ipv4         = "0.0.0.0/0"
+  ip_protocol       = "-1" # semantically equivalent to all ports
+}
+
+resource "aws_security_group_rule" "ingress_ssh" {
+  type              = "ingress"
+  from_port         = 22
+  to_port           = 22
+  protocol          = "-1"
+  cidr_blocks       = ["0.0.0.0/0"]
+  security_group_id = "sg-0354b4927b62c6393"
+}
+
+#--Create SG for Public and Private SG, attach to Private SG to EC2 instance.---
+
+
+# Create EC2 Instance on Public subnet
+data "aws_ami" "ubuntu" {
+  most_recent = true
+
+  filter {
+    name   = "name"
+    values = ["ubuntu/images/hvm-ssd/ubuntu-jammy-22.04-amd64-server-*"]
+  }
+
+  filter {
+    name   = "virtualization-type"
+    values = ["hvm"]
+  }
+
+  owners = ["099720109477"] # Canonical
+}
+resource "aws_instance" "jump-server" {
+  ami           = data.aws_ami.ubuntu.id
+  instance_type = "t2.micro"
+  key_name        = "terraform-kp"
+  subnet_id       = aws_subnet.terraform_public_subnet.id     # Announce the Subnet you want to associate, it will choose corresponding VPC automatically.
+  vpc_security_group_ids = ["sg-001aa592140f93dc4" ] #[web-sg = sg-001aa592140f93dc4 , private-sg= sg-0354b4927b62c6393]
+  associate_public_ip_address = true
+  tags = {
+    Name = "jump-server"
+  }  
+}
+
+# Create Nginx webserver in Private Subnet
+resource "aws_instance" "web" {
+  ami           = "ami-07c9c7aaab42cba5a"
+  instance_type = "t2.micro"
+  key_name        = "terraform-kp"
+  subnet_id       = aws_subnet.terraform_private_subnet.id # Announce the Subnet you want to associate, it will choose corresponding VPC automatically.
+  #security_groups = ["web-sg", "private-sg"]
+  vpc_security_group_ids = ["sg-0354b4927b62c6393" ] #[sg-001aa592140f93dc4 ,sg-0354b4927b62c6393]
+  #vpc_security_group_ids = [aws_security_group.basic_security.id]
+  associate_public_ip_address = false
+
+  tags = {
+    Name = "web-server"
+  }  
+}
